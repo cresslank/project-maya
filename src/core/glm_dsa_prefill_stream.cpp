@@ -87,7 +87,8 @@ int host_alloc_node(void** p, size_t bytes, int dev, bool dsa) {
     const auto plain = [&]() {
         const bool huge = pinned_huge_wanted(pinned_huge_env(getenv("MAYA_GLM_PIN_HUGETLB")), bytes);
         PinnedBacking backing = PinnedBacking::None;
-        const cudaError_t e = pinned_host_alloc(p, bytes, cudaHostAllocDefault, huge, &backing);
+        const cudaError_t e = pinned_host_alloc(p, bytes, cudaHostAllocDefault, huge,
+                                                PinnedHostAccess::NoHostDereference, &backing);
         if (e == cudaSuccess && backing == PinnedBacking::HugeTlb)
             std::fprintf(stderr, "glm prefill: CUDA%d disk landing ring %.0f MB pinned on 2 MB huge pages\n",
                          dev, (double) bytes / 1048576.0);

@@ -1,4 +1,4 @@
-// tests/pinned_host_test.cu - the ordinary pinned path and explicit 2 MB registration, through a real GPU copy.
+// tests/pinned_host_test.cu - ordinary pinned and explicit 2 MB blocks, through GPU copies and mapped access.
 // No model; the huge-page part uses the host's configured pool, or checks the ordinary allocation fallback.
 #include "strata/core/pinned_host.hpp"
 
@@ -46,6 +46,11 @@ static bool kernel_2m(const void* p) {
 
 static unsigned char pattern(size_t i) { return (unsigned char) ((i * 37 + i / 251) & 255); }
 
+static __global__ void mapped_xor(unsigned char* data, size_t bytes) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < bytes) data[i] ^= 0x5a;
+}
+
 int main() {
     CHECK(c::pinned_huge_env(nullptr) == -1 && c::pinned_huge_env("") == -1);
     CHECK(c::pinned_huge_env("0") == 0 && c::pinned_huge_env("00") == 0);
@@ -75,7 +80,8 @@ int main() {
     {
         void* host = nullptr;
         c::PinnedBacking backing = c::PinnedBacking::None;
-        if (cuda_ok(c::pinned_host_alloc(&host, 8 * 1024 * 1024, cudaHostAllocPortable, false, &backing),
+        if (cuda_ok(c::pinned_host_alloc(&host, 8 * 1024 * 1024, cudaHostAllocPortable, false,
+                                         c::PinnedHostAccess::HostAddress, &backing),
                     "ordinary pinned_host_alloc")) {
             CHECK(backing == c::PinnedBacking::CudaHostAlloc);
             CHECK(c::pinned_host_backing(host) == c::PinnedBacking::None);
@@ -99,17 +105,15 @@ int main() {
     const bool pool_holds = p::huge_pool_2m().total() >= bytes;
     void* host = nullptr;
     c::PinnedBacking backing = c::PinnedBacking::None;
-    if (cuda_ok(c::pinned_host_alloc(&host, bytes, cudaHostAllocPortable, true, &backing),
+    if (cuda_ok(c::pinned_host_alloc(&host, bytes, cudaHostAllocPortable, true,
+                                     c::PinnedHostAccess::NoHostDereference, &backing),
                 "huge pinned_host_alloc")) {
-        const bool expect_huge = pool_holds && mapped_usable;
+        const bool expect_huge = pool_holds;
         CHECK(backing == (expect_huge ? c::PinnedBacking::HugeTlb : c::PinnedBacking::CudaHostAlloc));
         CHECK(c::pinned_host_backing(host) == (expect_huge ? c::PinnedBacking::HugeTlb : c::PinnedBacking::None));
-        std::printf("pinned host: 64 MiB Portable %s (pool %s, registered host pointers %s)\n",
+        std::printf("pinned host: 64 MiB Portable copy-only %s (pool %s)\n",
                     backing == c::PinnedBacking::HugeTlb ? "HugeTlb" : "CudaHostAlloc fallback",
-                    pool_holds ? "holds it" : "too small", mapped_usable ? "supported" : "unsupported");
-        void* alias = nullptr;
-        CHECK(cuda_ok(cudaHostGetDevicePointer(&alias, host, 0), "cudaHostGetDevicePointer"));
-        if (backing == c::PinnedBacking::HugeTlb) CHECK(alias == host);
+                    pool_holds ? "holds it" : "too small");
 #ifdef __linux__
         if (backing == c::PinnedBacking::HugeTlb) CHECK(kernel_2m(host));
 #endif
@@ -140,7 +144,8 @@ int main() {
     {   // An explicit Mapped request keeps the same huge-page and host-address guarantees.
         host = nullptr;
         backing = c::PinnedBacking::None;
-        if (cuda_ok(c::pinned_host_alloc(&host, bytes, cudaHostAllocPortable | cudaHostAllocMapped, true, &backing),
+        if (cuda_ok(c::pinned_host_alloc(&host, bytes, cudaHostAllocPortable | cudaHostAllocMapped, true,
+                                         c::PinnedHostAccess::HostAddress, &backing),
                     "mapped huge pinned_host_alloc")) {
             CHECK(backing == (pool_holds && mapped_usable ? c::PinnedBacking::HugeTlb : c::PinnedBacking::CudaHostAlloc));
             void* alias = nullptr;
@@ -148,6 +153,41 @@ int main() {
             if (backing == c::PinnedBacking::HugeTlb) CHECK(alias == host);
             CHECK(c::pinned_host_free(host) == cudaSuccess);
         }
+    }
+    for (bool huge : {false, true}) {   // A translated pointer, on each GPU, for both backing paths.
+        host = nullptr;
+        backing = c::PinnedBacking::None;
+        if (!cuda_ok(c::pinned_host_alloc(&host, bytes, cudaHostAllocPortable | cudaHostAllocMapped, huge,
+                                          c::PinnedHostAccess::NoHostDereference, &backing),
+                     "translated pinned_host_alloc")) continue;
+        CHECK(backing == (huge && pool_holds ? c::PinnedBacking::HugeTlb : c::PinnedBacking::CudaHostAlloc));
+#ifdef __linux__
+        if (backing == c::PinnedBacking::HugeTlb) CHECK(kernel_2m(host));
+#endif
+        auto* data = (unsigned char*) host;
+        for (int dev = 0; dev < devices; ++dev) {
+            if (!cuda_ok(cudaSetDevice(dev), "mapped cudaSetDevice")) continue;
+            void* alias = nullptr;
+            if (!cuda_ok(cudaHostGetDevicePointer(&alias, host, 0), "translated cudaHostGetDevicePointer")) continue;
+            for (size_t i = 0; i < bytes; ++i) data[i] = pattern(i);
+            mapped_xor<<<(unsigned) ((bytes + 255) / 256), 256>>>((unsigned char*) alias, bytes);
+            if (cuda_ok(cudaGetLastError(), "mapped_xor launch") &&
+                cuda_ok(cudaDeviceSynchronize(), "mapped_xor synchronize")) {
+                bool match = true;
+                for (size_t i = 0; i < bytes; ++i) {
+                    if (data[i] != (unsigned char) (pattern(i) ^ 0x5a)) {
+                        std::printf("pinned host: mapped CUDA%d pattern differs at byte %zu\n", dev, i);
+                        match = false;
+                        break;
+                    }
+                }
+                CHECK(match);
+                if (match) std::printf("pinned host: CUDA%d mapped %s read/write matched\n", dev,
+                                      backing == c::PinnedBacking::HugeTlb ? "HugeTlb" : "CudaHostAlloc");
+            }
+        }
+        CHECK(c::pinned_host_free(host) == cudaSuccess);   // Free the host pointer, never the device alias.
+        CHECK(c::pinned_host_backing(host) == c::PinnedBacking::None);
     }
     if (fails == 0) std::printf("pinned host: ok\n");
     return fails == 0 ? 0 : 1;

@@ -645,7 +645,9 @@ static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags, bool huge =
                              strata::core::PinnedBacking* backing = nullptr, int node = -1, int nodes = 1) {
     static const int64_t cap = getenv("MAYA_GLM_PIN_CAP_MB") ? std::atoll(getenv("MAYA_GLM_PIN_CAP_MB")) << 20 : -1;
     if (cap >= 0 && g_pin_held + (int64_t) bytes > cap) return cudaErrorMemoryAllocation;
-    const cudaError_t e = strata::core::pinned_host_alloc(p, bytes, flags, huge, backing, node, nodes);
+    const cudaError_t e = strata::core::pinned_host_alloc(p, bytes, flags, huge,
+                                                        strata::core::PinnedHostAccess::HostAddress,
+                                                        backing, node, nodes);
     if (e == cudaSuccess) g_pin_held += (int64_t) bytes;
     return e;
 }
@@ -2036,7 +2038,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         bool huge_warned = false;
         const auto pin_block = [&](void** p, size_t bytes) {
             strata::core::PinnedBacking backing = strata::core::PinnedBacking::None;
-            // Keep the tier's Portable fallback; the huge path preserves host-address access itself.
+            // Keep the tier's Portable fallback; fetch kernels read the RAM tier at its host address.
             const cudaError_t e = pin_alloc(p, bytes, cudaHostAllocPortable, huge, &backing,
                                             strata::platform::kHugeInterleave, huge_nodes);
             if (e == cudaSuccess && huge && backing != strata::core::PinnedBacking::HugeTlb && !huge_warned) {

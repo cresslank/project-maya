@@ -1,6 +1,6 @@
 // include/strata/core/pinned_host.hpp - large page-locked host blocks on explicit 2 MB pages when asked and
-// available.  Huge blocks are always registered Mapped, and require every visible GPU to read them at their host
-// address, as with cudaHostAlloc.  A refused huge path takes cudaHostAlloc with the caller's flags unchanged.
+// available.  Huge blocks are always registered Mapped.  Unless the caller copies or translates the pointer,
+// every visible GPU must read them at their host address.  A refused huge path takes cudaHostAlloc unchanged.
 #pragma once
 
 #include "strata/platform/huge_pages.hpp"
@@ -14,6 +14,8 @@
 namespace strata::core {
 
 enum class PinnedBacking { None, CudaHostAlloc, HugeTlb };
+// NoHostDereference: GPU access is only through copies or cudaHostGetDevicePointer, never the host address.
+enum class PinnedHostAccess { HostAddress, NoHostDereference };
 constexpr uint64_t kPinnedHugeMin = (uint64_t) 32 << 20;
 
 inline int pinned_huge_env(const char* value) {
@@ -49,22 +51,25 @@ inline Registry& registry() {
 }  // namespace pinned_host_detail
 
 inline cudaError_t pinned_host_alloc(void** p, size_t bytes, unsigned flags, bool huge,
+                                     PinnedHostAccess access = PinnedHostAccess::HostAddress,
                                      PinnedBacking* backing = nullptr, int node = -1, int nodes = 1) {
     if (backing != nullptr) *backing = PinnedBacking::None;
     if (huge && p != nullptr && (flags & ~(cudaHostAllocPortable | cudaHostAllocMapped)) == 0) {
-        // Preserve cudaHostAlloc's host-address access even when the caller did not ask for Mapped.
-        int count = 0;
+        // Preserve cudaHostAlloc's host-address access unless the caller does not need it.
         bool usable = true;
-        if (cudaGetDeviceCount(&count) != cudaSuccess) {
-            cudaGetLastError();   // Clear only the failed CUDA call made here.
-            usable = false;
-        } else if (count == 0) usable = false;
-        for (int dev = 0; usable && dev < count; ++dev) {
-            int ok = 0;
-            if (cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev) != cudaSuccess) {
-                cudaGetLastError();   // Clear only the failed attribute query.
+        if (access == PinnedHostAccess::HostAddress) {
+            int count = 0;
+            if (cudaGetDeviceCount(&count) != cudaSuccess) {
+                cudaGetLastError();   // Clear only the failed CUDA call made here.
                 usable = false;
-            } else if (!ok) usable = false;
+            } else if (count == 0) usable = false;
+            for (int dev = 0; usable && dev < count; ++dev) {
+                int ok = 0;
+                if (cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev) != cudaSuccess) {
+                    cudaGetLastError();   // Clear only the failed attribute query.
+                    usable = false;
+                } else if (!ok) usable = false;
+            }
         }
         size_t got = 0;
         if (void* m = usable ? platform::huge_alloc(bytes, node, nodes, &got) : nullptr) {
