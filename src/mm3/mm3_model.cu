@@ -1434,7 +1434,8 @@ struct Model::Impl {
             const bool huge = strata::core::pinned_huge_wanted(hv, total);
             strata::core::PinnedBacking backing = strata::core::PinnedBacking::None;
             if (strata::core::pinned_host_alloc((void**) &kv_host, total, cudaHostAllocMapped | cudaHostAllocPortable,
-                                                huge, &backing) != cudaSuccess) {
+                                                huge, strata::core::PinnedHostAccess::NoHostDereference,
+                                                &backing) != cudaSuccess) {
                 kv_host = nullptr;
                 err = "KV streaming: " + std::to_string(total >> 20) + " MB of pinned host memory not allocated";
                 return false;
@@ -1444,11 +1445,20 @@ struct Model::Impl {
                                "sysctl vm.nr_hugepages=N reserves pages, sysctl vm.nr_overcommit_hugepages=N "
                                "allows pages on demand");
             size_t off = 0;
-            for (Layer& l : L) {
-                if (l.kvh.ring <= 0) continue;
-                k::kv_carve(kv_host + off, rows, o.kv_k, o.kv_v, o.kv_rot ? 3 : 0, l.kvh.kc, l.kvh.vc, l.kvh.q);
-                off += nb;
-                acct_kvh[D[(size_t) l.dev].id] += nb;
+            // Registered host memory can have a different device address on each GPU (notably on HIP).
+            for (const Dev& d : D) {
+                uint8_t* base = nullptr;
+                for (int li : d.layers) {
+                    Layer& l = L[(size_t) li];
+                    if (l.kvh.ring <= 0) continue;
+                    if (base == nullptr) {
+                        CK(cudaSetDevice(d.id));
+                        CK(cudaHostGetDevicePointer((void**) &base, kv_host, 0));
+                    }
+                    k::kv_carve(base + off, rows, o.kv_k, o.kv_v, o.kv_rot ? 3 : 0, l.kvh.kc, l.kvh.vc, l.kvh.q);
+                    off += nb;
+                    acct_kvh[d.id] += nb;
+                }
             }
             st.kv_ring = kv_ring;
             st.kv_host_gb = (double) total / (1u << 30);
@@ -1733,6 +1743,7 @@ struct Model::Impl {
             const bool huge = strata::core::pinned_huge_wanted(hv, want);
             strata::core::PinnedBacking backing = strata::core::PinnedBacking::None;
             while (want > 0 && strata::core::pinned_host_alloc((void**) &pool, want, cudaHostAllocPortable, huge,
+                                                               strata::core::PinnedHostAccess::NoHostDereference,
                                                                &backing) != cudaSuccess) {
                 pool = nullptr;
                 cudaGetLastError();

@@ -59,7 +59,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized (Apple Silicon: unified memory left free beside maya-metal's expert pool, from what is free when it starts); it also takes one more GPU's prompt buffers, pinned after the measurement - a split of three or more GPUs sets the others' aside on top, and each later GPU measures again and leaves at least half of it free. The pinned tier can't be swapped out, so a Linux desktop whose kernel starts swapping with more free (several displays, a busy session) wants more: a 128 GB desktop with three GPUs and three displays stayed responsive at 16, and swapped at 12 (#77) |
 | `MAYA_GLM_RAM_GB` | from free RAM | a fixed RAM-tier size in GB |
 | `MAYA_GLM_PIN_ROOM_MB` | 512 (Windows with a discrete AMD card: a tenth of the pinning cap) | where Windows caps the pinned memory, what the RAM tier leaves pinnable above it (rounded up to 256 MB) |
-| `MAYA_GLM_PIN_HUGETLB` | on when the pool holds it all | Linux: the RAM tier and the prompts' disk landing ring on explicit 2 MB pages; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line). See [the reserved or on-demand pool](#pinned-host-memory-on-2-mb-huge-pages-a-reserved-or-an-on-demand-pool) |
+| `MAYA_GLM_PIN_HUGETLB` | on when the pool holds it all (HIP: off) | Linux: the RAM tier and the prompts' disk landing ring on explicit 2 MB pages; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line). See [the reserved or on-demand pool](#pinned-host-memory-on-2-mb-huge-pages-a-reserved-or-an-on-demand-pool) |
 | `MAYA_GLM_POOL_CHECK_WAIT_MS` | 10000 | Linux with AMD GPUs (HIP) only: after the expert pool's check (`--expert-cache auto`) frees what it wrote, the start waits up to this many ms for that VRAM to read as free again before it sizes the pool - on some cards the free figure read right after the frees still counted them as in use, and the pool came out with 0 slots a layer and the start failed with "no room for the expert pool" (#899). It reads the free VRAM every 5 ms until it is back within 256 MiB of the figure before the check. When it had to wait, the log says `glm fast: CUDA<n> the expert pool's check: its <x> GB came back as free VRAM <ms> ms after it was freed`, or, when the time ran out first, a `WARNING ... still read as in use` line with how much (`MAYA_GLM_POOL_CHECK=0` skips the check); a start that did not have to wait prints neither. `0` = no wait (one read, as before). NVIDIA and Windows builds do not wait |
 | `MAYA_GLM_COMPLETE_POOL` | on | where the GPU's expert budget holds every expert, the 3 spares a layer and the prompt path's borrowed slots (the Ryzen AI Max APUs' memory on Windows - a Radeon 8065S holds Maya-S with ~60 GB to spare), each layer keeps exactly that many: the start loads every expert, a prompt borrows only the slots beyond them (none moved out, none read from the SSD again), the decode never misses and the CPU lane has nothing to take (8065S, Maya-S: decode +2.6-4%, +7% after an 8K-token prompt, the same answers; NVIDIA since v1.1.35, where a split held every expert and the capped pool lent residents to every long prompt: a 4x A100 split's decode 2.5x, #474). `0` = off (the capped pool, for A/B). Where the budget cannot hold every expert nothing changes. Linux APUs keep their unified-memory policy |
 | `MAYA_GLM_RESIDENT_SKIP` | AMD: on | while every expert is in VRAM, the decode leaves out each route's wait and fetch launches, which would find nothing to do (two a layer and token); `0` = launch them anyway; `1` = on for NVIDIA too |
@@ -1927,8 +1927,10 @@ file cache and 2 GiB free: one 60 GiB reservation was refused in 0.1 s; the same
 A block larger than the pool's room is refused at once. A piece the kernel still refuses after about 2 s gives
 the whole block up to the ordinary path. With a file-size limit (`ulimit -f`) smaller than the block, it is taken
 in one reservation instead of pieces. A failed huge-page allocation or GPU registration falls back to the ordinary
-path. GLM and MiniMax use explicit huge pages only where every GPU can read registered host memory at its host
-address; otherwise the ordinary path is used.
+path. GLM's landing ring and MiniMax's pinned pool use GPU copies, not GPU access at the host address.
+MiniMax's KV-streaming cache uses each GPU's mapped device address. These paths do not require the GPU to
+support reading registered memory at its host address (including discrete AMD cards reporting that it cannot).
+GLM's RAM tier is also read directly by GPU fetch kernels, so it still requires that support on every GPU.
 
 On PCs with two or more NUMA nodes GLM keeps its interleaved NUMA RAM tier in automatic mode; `1` puts it on huge
 pages interleaved over nodes 0 to n-1 (a PC whose node numbers have gaps leaves the missing ones out), and what
@@ -1940,8 +1942,8 @@ explicit `1` (untested there). On Windows and macOS these settings have no effec
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_GLM_PIN_HUGETLB` | on when the pool holds it all | the RAM tier and the prompts' disk landing ring; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line) |
-| `MAYA_MM3_PIN_HUGETLB` (`MM3_PIN_HUGETLB`) | on when the pool holds it all | the pinned pool and the KV-streaming host cache; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line) |
+| `MAYA_GLM_PIN_HUGETLB` | on when the pool holds it all (HIP: off) | the RAM tier and the prompts' disk landing ring; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line) |
+| `MAYA_MM3_PIN_HUGETLB` (`MM3_PIN_HUGETLB`) | on when the pool holds it all (HIP: off) | the pinned pool and the KV-streaming host cache; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line) |
 
 ## DeepSeek: the experts' RAM copies on 2 MB huge pages
 
@@ -2252,7 +2254,7 @@ Setup and debugging variables:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `MAYA_MM3_PIN_HUGETLB` (`MM3_PIN_HUGETLB`) | on when the pool holds it all | the pinned pool and KV-streaming host cache on explicit 2 MB pages; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line). See [the reserved or on-demand pool](#pinned-host-memory-on-2-mb-huge-pages-a-reserved-or-an-on-demand-pool) |
+| `MAYA_MM3_PIN_HUGETLB` (`MM3_PIN_HUGETLB`) | on when the pool holds it all (HIP: off) | the pinned pool and KV-streaming host cache on explicit 2 MB pages; `0`: ordinary pinned memory; `1`: from the pool as far as it goes, the rest ordinary (one log line). See [the reserved or on-demand pool](#pinned-host-memory-on-2-mb-huge-pages-a-reserved-or-an-on-demand-pool) |
 | `MAYA_MM3_HOST_FREE` | `1` | decode: a layer whose routed experts are all in VRAM plans them on the GPU, so a token or a verify window runs without waiting for the host at each layer; `0`: the host plans every layer (the same tokens) |
 | `MAYA_MM3_PIPE` | `1` | `--parallel` on a layer split: the GPUs as a pipeline (each holds a different group of the running conversations, the same tokens); `0`: all of them through the GPUs together, one GPU at a time |
 | `MAYA_MM3_GRAPH` | `1` | decode on one GPU with every MoE layer host-free: a token's and a verify window's forward replayed as one graph (the same tokens); `0`: launched kernel by kernel |
